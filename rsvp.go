@@ -2,7 +2,6 @@ package rsvp
 
 import (
 	"fmt"
-	"html/template"
 	"net/http"
 	"time"
 )
@@ -23,7 +22,10 @@ Users:
 - See RSVPs
 */
 
+type PersonId uint64
+
 type Person struct {
+	Id             PersonId
 	Name           string
 	Email          string
 	IsChild        bool
@@ -34,7 +36,10 @@ type Person struct {
 	// avatar?
 }
 
+type FamilyId uint64
+
 type Family struct {
+	Id         FamilyId
 	Name       string
 	People     []Person
 	AccessCode string
@@ -42,57 +47,21 @@ type Family struct {
 	// avatar?
 }
 
-type Head struct {
-	Title string
+type FamilyResponse struct {
+	Responses map[PersonId]bool
+	Notes     string
 }
 
-type Foot struct {
+type EventInstance struct {
+	Date      time.Time
+	Responses map[FamilyId]FamilyResponse
+	Notes     string
 }
 
 func init() {
 	http.HandleFunc("/", handler)
-	http.HandleFunc("/editProfile", editProfile)
-}
-
-func editProfile(w http.ResponseWriter, r *http.Request) {
-	type EditProfile struct {
-	}
-	body := EditProfile{}
-
-	tmpl, err := template.ParseFiles("head.tmpl")
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Fprint(w, "Template error: %v", err)
-		return
-	}
-	if tmpl.Execute(w, Head{"Edit Profile"}) != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Fprintf(w, "Template execute error: %v", err)
-	}
-
-	tmpl, err = template.ParseFiles("editProfile.tmpl")
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Fprint(w, "Template error: %v", err)
-		return
-	}
-	if tmpl.Execute(w, body) != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Fprintf(w, "Template execute error: %v", err)
-	}
-
-	tmpl, err = template.ParseFiles("foot.tmpl")
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Fprint(w, "Template error: %v", err)
-		return
-	}
-	if tmpl.Execute(w, Foot{}) != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Fprintf(w, "Template execute error: %v", err)
-	}
 }
 
 func handler(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprint(w, "Hello, world!")
+	fmt.Fprintf(w, "Hello, world! URL: %v", r.URL)
 }
