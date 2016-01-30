@@ -4,6 +4,10 @@ runtime: go
 api_version: go1
 
 handlers:
+- url: /app/admin/.*
+  script: _go_app
+  login: admin
+
 - url: /app/.*
   script: _go_app
 
