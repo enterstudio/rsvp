@@ -3,8 +3,14 @@ package rsvp
 import (
 	"fmt"
 	"net/http"
+	"runtime"
 	"strconv"
 	"time"
+
+	"golang.org/x/net/context"
+	"google.golang.org/appengine"
+	"google.golang.org/appengine/datastore"
+	"google.golang.org/appengine/log"
 )
 
 type Person struct {
@@ -12,19 +18,21 @@ type Person struct {
 }
 
 type Family struct {
+	// int key: family ID
 	People []Person
 	Token  string
 }
 
 type Response struct {
-	AttendCount uint8
+	// int key: family ID
+	AttendCount GuestCap
 	Note        string
 }
 
-type GuestCap uint8
+type GuestCap int8
 
 type EventInstance struct {
-	Date  string // YYYY-MM-DD
+	// string key: date
 	Notes string
 	Cap   GuestCap
 }
@@ -35,6 +43,14 @@ func init() {
 	http.HandleFunc("/app/admin/responses", adminResponses)
 	http.HandleFunc("/app/admin/schedule", adminSchedule)
 	http.HandleFunc("/app/admin/users", adminUsers)
+}
+
+func logError(w http.ResponseWriter, ctx context.Context, s string, status int) {
+	log.Errorf(ctx, "%v", s)
+	buf := make([]byte, 65536)
+	runtime.Stack(buf, false)
+	log.Errorf(ctx, "%v", string(buf))
+	http.Error(w, s, status)
 }
 
 func rsvp(w http.ResponseWriter, r *http.Request) {
@@ -48,73 +64,80 @@ func rsvp(w http.ResponseWriter, r *http.Request) {
 			   attending: int
 			   note: string
 	*/
-	r.ParseForm()
-	familyId := r.Form.Get("family")
-	token := r.Form.Get("token")
-	if !familyId || !token {
-		http.Error(w, "Missing param family or token.", http.StatusBadRequest)
-		return
-	}
-
-	familyId, err := strconv.Atoi(familyId)
-	if err {
-		http.Error(w, "Invalid family ID.", http.StatusBadRequest)
-		return
-	}
-
 	ctx := appengine.NewContext(r)
-	var family Family
-	familyKey := datastore.NewKey(ctx, "Family", nil, familyId, nil)
-	if err = datastore.Get(ctx, familyKey, &family); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	if !family || family.Token != token {
-		http.Error(w, "Family not found or token invalid.", http.StatusNotFound)
+	r.ParseForm()
+
+	familyIdStr := r.Form.Get("family")
+	token := r.Form.Get("token")
+	if familyIdStr == "" || token == "" {
+		logError(w, ctx, "Missing param family or token.", http.StatusBadRequest)
 		return
 	}
 
-	if r.method == "POST" {
+	familyId, err := strconv.ParseInt(familyIdStr, 10, 64)
+	if err != nil {
+		logError(w, ctx, "Invalid family ID.", http.StatusBadRequest)
+		return
+	}
+
+	family := new(Family)
+	familyKey := datastore.NewKey(ctx, "Family", "", familyId, nil)
+	err = datastore.Get(ctx, familyKey, family)
+	if err != nil && err != datastore.ErrNoSuchEntity {
+		logError(w, ctx, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err == datastore.ErrNoSuchEntity || family.Token != token {
+		logError(w, ctx, "Family not found or token invalid.", http.StatusNotFound)
+		return
+	}
+
+	if r.Method == "POST" {
 		date := r.Form.Get("date")
-		attending := r.Form.Get("attending")
+		attendingStr := r.Form.Get("attending")
 		note := r.Form.Get("note")
-		if !date || !attending {
-			http.Error(w, "Missing date or attending params.", http.StatusBadRequest)
+		if date == "" || attendingStr == "" {
+			logError(w, ctx, "Missing date or attending params.", http.StatusBadRequest)
 			return
 		}
-		attending, err = strconv.Atoi(attending)
+
+		i, err := strconv.ParseInt(attendingStr, 10, 8)
 		if err != nil {
-			http.Error(w, "Invalid attending count.", http.StatusBadRequest)
+			logError(w, ctx, "Invalid attending count.", http.StatusBadRequest)
+			return
+		}
+		attending := GuestCap(i)
+
+		event := new(EventInstance)
+		eventKey := datastore.NewKey(ctx, "EventInstance", date, 0, nil)
+		err = datastore.Get(ctx, eventKey, event)
+		if err != nil && err != datastore.ErrNoSuchEntity {
+			logError(w, ctx, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if err == datastore.ErrNoSuchEntity {
+			logError(w, ctx, "Event not found.", http.StatusNotFound)
 			return
 		}
 
-		var event EventInstance
-		eventKey := datastore.NewKey(ctx, "EventInstance", date, nil, nil)
-		if err = datastore.Get(ctx, eventKey, &event); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+		responseKey := datastore.NewKey(ctx, "Response", "", familyId, eventKey)
+		var existingCount GuestCap
+		response := new(Response)
+		err = datastore.Get(ctx, responseKey, response)
+		if err != nil && err != datastore.ErrNoSuchEntity {
+			logError(w, ctx, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		if !event {
-			http.Error(w, "Event not found.", http.StatusNotFound)
-			return
-		}
-
-		responseKey := datastore.NewKey(ctx, "Response", familyId, nil, &eventKey)
-		existingCount := 0
-		var response Response
-		if err = datastore.Get(ctx, responseKey, &response); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		if response {
+		if err != datastore.ErrNoSuchEntity {
 			existingCount = response.AttendCount
 		}
 
+		log.Infof(ctx, "Checking cap: %v new, %v current", attending, existingCount)
 		if attending > existingCount {
-			totalCount := 0
+			var totalCount GuestCap
 
 			q := datastore.NewQuery("Response").
-				Ancestor(&eventKey)
+				Ancestor(eventKey)
 			for t := q.Run(ctx); ; {
 				var r Response
 				rFam, err := t.Next(&r)
@@ -122,40 +145,41 @@ func rsvp(w http.ResponseWriter, r *http.Request) {
 					break
 				}
 				if err != nil {
-					http.Error(w, err.Error(), http.StatusInternalServerError)
+					logError(w, ctx, err.Error(), http.StatusInternalServerError)
 					return
 				}
-				if rFam != familyId {
+				if rFam.IntID() != familyId {
 					totalCount += r.AttendCount
 				}
 			}
 
-			if totalCount > event.Cap {
-				http.Error(w, "Too many attendees.", http.StatusUnauthorized)
+			log.Infof(ctx, "Cap check: Cap is %v, existing %v, attending %v", event.Cap, totalCount, attending)
+			if totalCount+attending > event.Cap {
+				logError(w, ctx, "Too many attendees.", http.StatusUnauthorized)
 				return
 			}
 		}
 
 		response.AttendCount = attending
 		response.Note = note
-		if _, err = datastore.Put(ctx, responseKey, &response); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+		if _, err = datastore.Put(ctx, responseKey, response); err != nil {
+			logError(w, ctx, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
-		w.WriteHeader(http.StatusOk)
-		w.Write("Thank you.")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "Thank you.\n")
 	} else {
 		// Get this family's responses for those events.
-		seattle, err := time.Location.LoadLocation("America/Los_Angeles")
+		seattle, err := time.LoadLocation("America/Los_Angeles")
 		if err != nil {
-			http.Error(w, "Couldn't find Seattle.", http.StatusInternalServerError)
+			logError(w, ctx, "Couldn't find Seattle.", http.StatusInternalServerError)
 			return
 		}
-		todayInSeattle = time.Now().In(seattle).Format("2006-01-02")
+		todayInSeattle := time.Now().In(seattle).Format("2006-01-02")
 		q := datastore.NewQuery("EventInstance").
-			Filter("Date >=", todayInSeattle).
-			Order("Date")
+			Filter("__key__ >=", datastore.NewKey(ctx, "EventInstance", todayInSeattle, 0, nil)).
+			Order("__key__")
 		for t := q.Run(ctx); ; {
 			var e EventInstance
 			eventKey, err := t.Next(&e)
@@ -163,20 +187,21 @@ func rsvp(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
+				logError(w, ctx, err.Error(), http.StatusInternalServerError)
 				return
 			}
 
-			k := datastore.NewKey(ctx, "Response", nil, familyId, &eventKey)
+			k := datastore.NewKey(ctx, "Response", "", familyId, eventKey)
 			r := new(Response)
-			if err := datastore.Get(ctx, k, r); err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
+			err = datastore.Get(ctx, k, r)
+			if err != nil && err != datastore.ErrNoSuchEntity {
+				logError(w, ctx, err.Error(), http.StatusInternalServerError)
 				return
 			}
-			if r {
-				fmt.Fprintf(w, "%v: Found response: %v attending, note: %q\n", e.Date, response.AttendCount, response.Note)
+			if err == datastore.ErrNoSuchEntity {
+				fmt.Fprintf(w, "%v: No response\n", eventKey.StringID())
 			} else {
-				fmt.Fprintf(w, "%v: No response\n", e.Date)
+				fmt.Fprintf(w, "%v: Found response: %v attending, note: %q\n", eventKey.StringID(), r.AttendCount, r.Note)
 			}
 		}
 	}
@@ -190,20 +215,19 @@ func adminSchedule(w http.ResponseWriter, r *http.Request) {
 	// GET or POST?
 	ctx := appengine.NewContext(r)
 	// TODO: Initialize a couple of events.
-	/**
-	k := datastore.NewKey(ctx, "Family", nil, 1, nil)
-	f := new(Family)
-	f.Token = "cat"
+	k := datastore.NewKey(ctx, "EventInstance", "2016-02-01", 0, nil)
+	f := new(EventInstance)
+	f.Cap = 2
 	if _, err := datastore.Put(ctx, k, f); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
-	}*/
+	}
 }
 
 func adminUsers(w http.ResponseWriter, r *http.Request) {
 	// GET or POST?
 	ctx := appengine.NewContext(r)
-	k := datastore.NewKey(ctx, "Family", nil, 1, nil)
+	k := datastore.NewKey(ctx, "Family", "", 1, nil)
 	f := new(Family)
 	f.Token = "cat"
 	if _, err := datastore.Put(ctx, k, f); err != nil {
