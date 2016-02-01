@@ -12,7 +12,6 @@ import (
 	"google.golang.org/appengine/datastore"
 	"google.golang.org/appengine/log"
 	"stablelib.com/v1/net/nosurf"
-	"stablelib.com/v1/net/secure"
 )
 
 type EntityId int64
@@ -43,23 +42,40 @@ type EventInstance struct {
 	Cap   GuestCap
 }
 
-func init() {
-	secOptions := secure.Options{
-		FrameDeny:            true,
-		ContentTypeNosniff:   true,
-		BrowserXssFilter:     true,
-		AllowedHosts:         []string{"spaghetti.sachsfam.org"},
-		SSLRedirect:          true,
-		STSSeconds:           31536000,
-		STSIncludeSubdomains: true,
-	}
-	sec := secure.New(secOptions)
+func addHeaders(handler func(w http.ResponseWriter, r *http.Request)) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx := appengine.NewContext(r)
 
-	http.HandleFunc("/", sec.Handler(handler))
-	http.HandleFunc("/app/rsvp", sec.Handler(rsvp))
-	http.HandleFunc("/app/admin/responses", nosurf.NewPure(sec.Handler(adminResponses)))
-	http.HandleFunc("/app/admin/schedule", nosurf.NewPure(sec.Handler(adminSchedule)))
-	http.HandleFunc("/app/admin/users", nosurf.NewPure(sec.Handler(adminUsers)))
+		if r.Host != "spaghetti.sachsfam.org" {
+			logError(w, ctx, "Bad host", http.StatusBadRequest)
+			return
+		}
+		if r.URL.Scheme != "https" {
+			url := r.URL
+			url.Scheme = "https"
+			http.Redirect(w, r, url.String(), http.StatusMovedPermanently)
+			return
+		}
+		w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-XSS-Protection", "1; mode=block")
+
+		handler(w, r)
+	}
+
+}
+
+func noXSRF(handler func(http.ResponseWriter, *http.Request)) {
+	return handler
+}
+
+func init() {
+	http.HandleFunc("/", addHeaders(handler))
+	http.HandleFunc("/app/rsvp", addHeaders(rsvp))
+	http.HandleFunc("/app/admin/responses", addHeaders(noXSRF(adminResponses)))
+	http.HandleFunc("/app/admin/schedule", addHeaders(noXSRF(adminSchedule)))
+	http.HandleFunc("/app/admin/users", addHeaders(noXSRF(adminUsers)))
 }
 
 func logError(w http.ResponseWriter, ctx context.Context, s string, status int) {
@@ -97,11 +113,11 @@ func loadFamily(w http.ResponseWriter, r *http.Request, ctx context.Context) (*F
 }
 
 type RsvpData struct {
-	Event            *Event
-	EventKey         *Key
+	Event            *EventInstance
+	EventKey         *datastore.Key
 	ExistingResponse *Response
 	NewResponse      *Response
-	ResponseKey      *Key
+	ResponseKey      *datastore.Key
 }
 
 func parseRsvp(EntityId familyId, w http.ResponseWriter, r *http.Request, ctx context.Context) (RsvpData, bool) {
