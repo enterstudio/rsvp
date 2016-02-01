@@ -14,8 +14,6 @@ import (
 	"stablelib.com/v1/net/nosurf"
 )
 
-type EntityId int64
-
 type Person struct {
 	Email string
 }
@@ -42,7 +40,7 @@ type EventInstance struct {
 	Cap   GuestCap
 }
 
-func addHeaders(handler func(w http.ResponseWriter, r *http.Request)) {
+func addHeaders(handler func(w http.ResponseWriter, r *http.Request)) func(http.ResponseWriter, *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := appengine.NewContext(r)
 
@@ -66,7 +64,7 @@ func addHeaders(handler func(w http.ResponseWriter, r *http.Request)) {
 
 }
 
-func noXSRF(handler func(http.ResponseWriter, *http.Request)) {
+func noXSRF(handler func(http.ResponseWriter, *http.Request)) func(http.ResponseWriter, *http.Request) {
 	return handler
 }
 
@@ -86,7 +84,7 @@ func logError(w http.ResponseWriter, ctx context.Context, s string, status int) 
 	http.Error(w, s, status)
 }
 
-func loadFamily(w http.ResponseWriter, r *http.Request, ctx context.Context) (*Family, EntityId, bool) {
+func loadFamily(w http.ResponseWriter, r *http.Request, ctx context.Context) (*Family, int64, bool) {
 	familyIdStr := r.Form.Get("family")
 	if familyIdStr == "" {
 		logError(w, ctx, "Missing param family.", http.StatusBadRequest)
@@ -120,7 +118,7 @@ type RsvpData struct {
 	ResponseKey      *datastore.Key
 }
 
-func parseRsvp(EntityId familyId, w http.ResponseWriter, r *http.Request, ctx context.Context) (RsvpData, bool) {
+func parseRsvp(familyId int64, w http.ResponseWriter, r *http.Request, ctx context.Context) (RsvpData, bool) {
 	var ret RsvpData
 
 	date := r.Form.Get("date")
@@ -151,7 +149,6 @@ func parseRsvp(EntityId familyId, w http.ResponseWriter, r *http.Request, ctx co
 	}
 
 	ret.ResponseKey = datastore.NewKey(ctx, "Response", "", familyId, ret.EventKey)
-	var existingCount GuestCap
 	ret.ExistingResponse = new(Response)
 	err = datastore.Get(ctx, ret.ResponseKey, ret.ExistingResponse)
 	if err != nil && err != datastore.ErrNoSuchEntity {
@@ -168,11 +165,11 @@ func parseRsvp(EntityId familyId, w http.ResponseWriter, r *http.Request, ctx co
 	return ret, false
 }
 
-func queryFutureEvents(ctx context.Context) *datastore.Query {
+func queryFutureEvents(w http.ResponseWriter, ctx context.Context) *datastore.Query {
 	seattle, err := time.LoadLocation("America/Los_Angeles")
 	if err != nil {
 		logError(w, ctx, "Couldn't find Seattle.", http.StatusInternalServerError)
-		return
+		return nil
 	}
 	todayInSeattle := time.Now().In(seattle).Format("2006-01-02")
 	return datastore.NewQuery("EventInstance").
@@ -234,13 +231,13 @@ func rsvp(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
-			if totalCount+rsvpData.NewResponse.AttendCount > event.Cap {
+			if totalCount+rsvpData.NewResponse.AttendCount > rsvpData.Event.Cap {
 				logError(w, ctx, "Too many attendees.", http.StatusUnauthorized)
 				return
 			}
 		}
 
-		if _, err = datastore.Put(ctx, rsvpData.ResponseKey, rsvpData.NewResponse); err != nil {
+		if _, err := datastore.Put(ctx, rsvpData.ResponseKey, rsvpData.NewResponse); err != nil {
 			logError(w, ctx, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -249,7 +246,7 @@ func rsvp(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "Thank you.\n")
 	} else {
 		// Get this family's responses for those events.
-		q := queryFutureEvents(ctx)
+		q := queryFutureEvents(w, ctx)
 		for t := q.Run(ctx); ; {
 			var e EventInstance
 			eventKey, err := t.Next(&e)
@@ -288,14 +285,16 @@ func adminResponses(w http.ResponseWriter, r *http.Request) {
 	ctx := appengine.NewContext(r)
 	r.ParseForm()
 	if r.Method == "POST" {
-		if family, familyId, err := loadFamily(w, r, ctx); err {
+		_, familyId, err := loadFamily(w, r, ctx)
+		if err {
 			return
 		}
-		if rsvpData, err := parseRsvp(familyId, w, r, ctx); err {
+		rsvpData, err := parseRsvp(familyId, w, r, ctx)
+		if err {
 			return
 		}
 
-		if _, err = datastore.Put(ctx, rsvpData.ResponseKey, rsvpData.NewResponse); err != nil {
+		if _, err := datastore.Put(ctx, rsvpData.ResponseKey, rsvpData.NewResponse); err != nil {
 			logError(w, ctx, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -303,12 +302,12 @@ func adminResponses(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintf(w, "Thank you.\n")
 	} else {
-		token := nosurf.Token(req) // csrf_token
+		nosurf.Token(r) // csrf_token
 
-		q := queryFutureEvents(ctx)
+		q := queryFutureEvents(w, ctx)
 		for t := q.Run(ctx); ; {
 			var e EventInstance
-			eventKey, err := t.Next(&e)
+			_, err := t.Next(&e)
 			if err == datastore.Done {
 				break
 			}
@@ -321,7 +320,7 @@ func adminResponses(w http.ResponseWriter, r *http.Request) {
 				Order("FamilyName")
 			for t2 := q2.Run(ctx); ; {
 				var r Response
-				responseKey, err := t2.Next(&r)
+				_, err := t2.Next(&r)
 				if err == datastore.Done {
 					break
 				}
